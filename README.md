@@ -35,11 +35,13 @@ This is a fork of [antigravity-usage](https://github.com/BoeyCorp/antigravity-us
 - **Real Token Counts**: Today's token usage (input + output + cache) is aggregated directly from local transcript `usage` blocks, broken down per model.
 
 ### 4. Quota Limits, Burn Rate & Desktop Alerts
-- **Real-Time Quota Buckets**: Live quota information fetched from `claude -p /usage --output-format json --no-session-persistence` (Claude Code's own local `/usage` command), covering the Current Session and Current Week (all models) limits your subscription actually reports.
+- **Real-Time Quota Buckets**: Live quota fetched from Omarchy's own first-party `omarchy-agent-usage-claude --limits-only` collector — the same command that backs the built-in Agents panel. It hits Anthropic's authoritative OAuth usage endpoint directly (using the access token already in `~/.claude/.credentials.json`), so numbers are exact, structured JSON with real ISO reset times — no scraping, no timezone-text parsing.
+- **Per-Model Scoped Limits**: Any model-specific window your account has (e.g. an Opus-only weekly cap) shows up as its own row alongside the plan-wide Session and Weekly buckets, labeled from what the collector reports (`Opus Weekly`, etc.) instead of collapsing into the generic bucket.
 - **Burn Rate Velocity & Reset Forecasting**: Real-time hourly consumption tracking (`🔥 X%/h`) and intelligent reset pacing projections (`On pace · ~65% at reset` or early warnings `Depletes in ~2.0h before reset`), computed the same way as the original project from timestamped local snapshots.
-- **Dual Reset Time Display**: Shows both relative countdown timers (e.g. `2h 15m`) and exact local wall-clock times (e.g. `04:15 AM`), parsed from `/usage`'s human-readable reset time (e.g. `resets Sep 18, 8pm (Australia/Perth)`) into a real timezone-aware timestamp.
+- **Dual Reset Time Display**: Shows both relative countdown timers (e.g. `2h 15m`) and exact local wall-clock times (e.g. `04:15 AM`).
+- **Real Tier Label**: The bar/popup show your actual plan (`Pro`, `Max 5x`, …) as reported by the collector, instead of a generic placeholder.
 - **Configurable Low Quota Alerts**: Toggle desktop notifications on/off and configure custom remaining percentage thresholds (5% to 50%, default 15%) via `omarchy-notification-send`.
-- **Cheap & Cached**: `/usage` is a local Claude Code command — it resolves in well under a second and doesn't spend any API/model quota itself. The scanner caches the result, serves it instantly on every poll, and only re-queries in a detached background process once the cache is older than 3 minutes (with exponential backoff on failures), so the bar widget never blocks waiting on it.
+- **Cheap & Cached**: the collector resolves in well under a second. The scanner caches its result, serves it instantly on every poll, and only re-queries in a detached background process once the cache is older than 3 minutes (with exponential backoff on failures), so the bar widget never blocks waiting on it.
 
 ### 5. Performance & Telemetry
 - **Sub-50ms High Performance**: Incremental transcript caching indexed by file modification time and size keeps full telemetry and session scans fast even with dozens of past sessions.
@@ -51,17 +53,19 @@ This is a fork of [antigravity-usage](https://github.com/BoeyCorp/antigravity-us
 - **Tool Telemetry Breakdown**: Live call counters for tools (`Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`, `WebSearch`, etc.).
 - **Stale Session Pruning**: Automatically prunes `~/.claude/sessions/*.json` entries whose backing process has already exited.
 
-### 6. Dual Omarchy Integration
-- **Standalone Bar Widget**: Full-featured QML popup panel (`boeycorp.claude-usage`).
-- **Native Agents Panel Collector**: Includes companion binary (`bin/omarchy-agent-usage-claude`) compatible with Omarchy's system-wide `omarchy.agents` contract (`--limits-only`).
+### 6. Live Hook Updates (optional)
+- **Instant Refresh on Session Events**: An opt-in **Live Hook Updates** section in the settings panel wires Claude Code's own `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PermissionRequest`, and `SessionEnd` hooks to ping the bar the moment they fire, instead of waiting for the next scheduled poll (10–60s).
+- **Non-Destructive Install**: A single Install button adds one lightweight hook entry per event to `~/.claude/settings.json` — every other hook you (or another plugin, e.g. Herdr) already have configured, for any event, is left completely untouched. A timestamped backup (`settings.json.claude-usage.bak`) is written before every change.
+- **One-Click Removal**: The same button, now labeled Remove, takes out only the entries this plugin added; nothing else in `settings.json` is affected.
+- **Still Polls as a Safety Net**: The adaptive refresh timer keeps running regardless, so quota burn-rate tracking and anything the hooks don't cover stay up to date even without them installed.
 
 ---
 
 ## Requirements
 
-- Python 3.9+ (standard library only: `json`, `datetime`, `pathlib`, `collections`, `subprocess`, `signal`, `fcntl`, `zoneinfo`)
-- [Claude Code](https://claude.com/product/claude-code) CLI (`claude`) on `PATH`, logged in, with local session data in `~/.claude` — the Quota Limits card shells out to `claude -p /usage` for real numbers
-- Omarchy Shell / Quickshell
+- Python 3.9+ (standard library only: `json`, `datetime`, `pathlib`, `collections`, `subprocess`, `signal`, `fcntl`)
+- [Claude Code](https://claude.com/product/claude-code) CLI (`claude`) on `PATH`, logged in, with local session data in `~/.claude`
+- Omarchy Shell / Quickshell, with its first-party `omarchy-agent-usage-claude` collector on `PATH` (ships with Omarchy itself — it's what the Quota Limits card calls for real numbers, the same command that backs the built-in Agents panel)
 
 ---
 
@@ -72,14 +76,7 @@ omarchy plugin add https://github.com/BoeyCorp/claude-usage.git --enable
 omarchy restart shell
 ```
 
-### (Optional) Native `omarchy.agents` Panel Integration
-
-To also include Claude Code as a tab inside Omarchy's built-in Agents panel:
-
-```sh
-mkdir -p ~/.local/bin
-ln -sf ~/.config/omarchy/plugins/boeycorp.claude-usage/bin/omarchy-agent-usage-claude ~/.local/bin/omarchy-agent-usage-claude
-```
+There's no separate Agents-panel integration step needed — Omarchy's own `omarchy-agent-usage-claude` collector already backs the built-in Agents panel, and this widget calls that same command for its Quota Limits card.
 
 ---
 
@@ -101,11 +98,7 @@ omarchy plugin remove boeycorp.claude-usage
 omarchy restart shell
 ```
 
-If you configured the optional Agents panel integration:
-
-```sh
-rm -f ~/.local/bin/omarchy-agent-usage-claude
-```
+If you installed the [Live Hook Updates](#6-live-hook-updates-optional) feature, remove its hooks first (from the widget's settings panel, or `python3 ~/.config/omarchy/plugins/boeycorp.claude-usage/scripts/claude_usage_hooks.py remove`) so they don't linger as dead entries in `~/.claude/settings.json` — the hook command itself (`omarchy-shell -q ...`) fails silently if left behind, but it's still dead weight worth cleaning up.
 
 ---
 
@@ -128,15 +121,17 @@ rm -f ~/.local/bin/omarchy-agent-usage-claude
 
 ### IPC Commands & Custom Keybindings
 
-The widget registers an IPC target (`boeycorp.claude-usage`), allowing compositor keybindings (e.g. Hyprland / Sway):
+The widget registers an IPC target (`boeycorp.claude-usage`), callable as `omarchy-shell <target> <method>`, allowing compositor keybindings (e.g. Hyprland / Sway):
 
 | Action | Command |
 |---|---|
-| Toggle popup | `omarchy-shell shell toggle boeycorp.claude-usage` |
-| Open popup | `omarchy-shell shell summon boeycorp.claude-usage` |
-| Close popup | `omarchy-shell shell hide boeycorp.claude-usage` |
-| Refresh telemetry | `omarchy-shell ipc call boeycorp.claude-usage refresh` |
-| Open settings | `omarchy-shell ipc call boeycorp.claude-usage settings` |
+| Toggle popup | `omarchy-shell boeycorp.claude-usage toggle` |
+| Open popup | `omarchy-shell boeycorp.claude-usage open` |
+| Close popup | `omarchy-shell boeycorp.claude-usage close` |
+| Refresh telemetry | `omarchy-shell boeycorp.claude-usage refresh` |
+| Open settings | `omarchy-shell boeycorp.claude-usage settings` |
+
+Add `-q` to suppress output and fail silently if the shell isn't running (used internally by the Live Hook Updates feature above).
 
 ---
 
@@ -153,12 +148,14 @@ Configuration lives in `~/.config/omarchy/shell.json` or can be adjusted directl
 | `terminalCommand` | string | `""` | Terminal emulator command override (`foot`, `ghostty`, `kitty`, `alacritty`, or blank for `xdg-terminal-exec`) |
 | `recentSessionsLimit` | integer (3–10) | `5` | Initial number of recent sessions to display before expanding |
 
-Two environment variables are also honored by the scanner script itself (not exposed in the settings UI):
+**Live Hook Updates** (see [feature 6](#6-live-hook-updates-optional)) isn't a `shell.json` setting — it's real state read fresh from `~/.claude/settings.json` each time you open the settings panel, with its own Install/Remove button rather than a toggle.
+
+Two environment variables are also honored by the scripts themselves (not exposed in the settings UI):
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLAUDE_USAGE_DATA_DIR` | `~/.claude` | Override the Claude Code data directory the scanner reads |
-| `CLAUDE_USAGE_CLI` | first `claude` on `PATH` | Override the `claude` binary used for the `/usage` quota query |
+| `CLAUDE_USAGE_DATA_DIR` | `~/.claude` | Override the Claude Code data directory the scanner (and hooks installer) reads |
+| `CLAUDE_USAGE_AGENT_COLLECTOR` | first `omarchy-agent-usage-claude` on `PATH` | Override the collector binary used for the Quota Limits card |
 
 ---
 

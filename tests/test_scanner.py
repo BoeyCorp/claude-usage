@@ -25,7 +25,7 @@ from claude_usage_scanner import (
     format_hours_duration,
     normalize_timestamp_seconds,
     parse_transcripts,
-    parse_usage_output,
+    parse_agent_collector_limits,
     fetch_claude_usage_quota,
     check_and_send_quota_notifications,
     get_quota_backoff,
@@ -231,41 +231,82 @@ class TestClaudeUsageScanner(unittest.TestCase):
                 except Exception:
                     pass
 
-    def test_parse_usage_output(self):
-        text = (
-            "You are currently using your subscription to power your Claude Code usage\n\n"
-            "Current session: 11% used · resets Sep 18, 8pm (Australia/Perth)\n"
-            "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)\n\n"
-            "What's contributing to your limits usage?"
-        )
-        parsed = parse_usage_output(text)
+    def test_parse_agent_collector_limits(self):
+        record = {
+            "tierLabel": "Pro",
+            "limits": [
+                {"label": "Session (5-hour)", "percent": 0.11, "resetsAt": "2026-09-18T12:00:00+00:00"},
+                {"label": "Weekly (7-day)", "percent": 0.02, "resetsAt": "2026-09-23T04:00:00+00:00"},
+            ],
+        }
+        parsed = parse_agent_collector_limits(record)
         self.assertEqual(len(parsed["groups"]), 1)
         buckets = {b["id"]: b for b in parsed["groups"][0]["buckets"]}
         self.assertIn("session", buckets)
         self.assertIn("weekly", buckets)
         self.assertAlmostEqual(buckets["session"]["remaining_fraction"], 0.89)
         self.assertAlmostEqual(buckets["weekly"]["remaining_fraction"], 0.98)
-        # Perth (UTC+8, no DST): 8pm -> 12:00 UTC, 12pm -> 04:00 UTC
-        self.assertTrue(buckets["session"]["reset_time"].startswith("20"))
-        self.assertIn("T12:00:00", buckets["session"]["reset_time"])
-        self.assertIn("T04:00:00", buckets["weekly"]["reset_time"])
+        self.assertEqual(buckets["session"]["reset_time"], "2026-09-18T12:00:00+00:00")
 
-    def test_parse_usage_output_no_match(self):
-        parsed = parse_usage_output("some unrelated text with no usage lines")
-        self.assertEqual(parsed, {"groups": []})
+    def test_parse_agent_collector_limits_model_scoped(self):
+        """A model-scoped limit (e.g. an Opus-only weekly cap) must survive as its own bucket,
+        not collapse into the generic weekly bucket."""
+        record = {
+            "limits": [
+                {"label": "Session (5-hour)", "percent": 0.10, "resetsAt": ""},
+                {"label": "Weekly (7-day)", "percent": 0.05, "resetsAt": ""},
+                {"label": "Opus Weekly", "percent": 0.40, "resetsAt": "2026-09-23T04:00:00+00:00"},
+            ],
+        }
+        parsed = parse_agent_collector_limits(record)
+        buckets = {b["id"]: b for b in parsed["groups"][0]["buckets"]}
+        self.assertEqual(len(buckets), 3)
+        self.assertIn("opus-weekly", buckets)
+        self.assertAlmostEqual(buckets["opus-weekly"]["remaining_fraction"], 0.60)
+        self.assertEqual(buckets["opus-weekly"]["name"], "Opus Weekly")
+
+    def test_parse_agent_collector_limits_no_entries(self):
+        self.assertEqual(parse_agent_collector_limits({"limits": []}), {"groups": []})
+        self.assertEqual(parse_agent_collector_limits({}), {"groups": []})
+
+    def test_format_quota_groups_scoped_label_and_order(self):
+        """Weekly sorts above Session, and a scoped limit keeps its own label instead of being
+        relabeled 'Weekly Limit'."""
+        from claude_usage_scanner import format_quota_groups
+        raw = {
+            "groups": [{
+                "name": "Claude Usage",
+                "buckets": [
+                    {"id": "session", "name": "Session (5-hour)", "window": "session", "remaining_fraction": 0.9},
+                    {"id": "opus-weekly", "name": "Opus Weekly", "window": "", "remaining_fraction": 0.6},
+                    {"id": "weekly", "name": "Weekly (7-day)", "window": "weekly", "remaining_fraction": 0.95},
+                ],
+            }]
+        }
+        formatted = format_quota_groups(raw)
+        ids_in_order = [b["id"] for b in formatted[0]["buckets"]]
+        self.assertEqual(ids_in_order, ["weekly", "session", "opus-weekly"])
+        labels = {b["id"]: b["label"] for b in formatted[0]["buckets"]}
+        self.assertEqual(labels["weekly"], "Weekly Limit")
+        self.assertEqual(labels["session"], "Session Limit")
+        self.assertEqual(labels["opus-weekly"], "Opus Weekly")
 
     def test_fetch_claude_usage_quota_uses_query_and_caches(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
             pdir = Path(tmpdir)
-            canned = (
-                "Current session: 10% used · resets Sep 18, 8pm (Australia/Perth)\n"
-                "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)"
-            )
-            with patch("claude_usage_scanner.query_usage_text", return_value=canned) as mock_query:
+            canned = {
+                "tierLabel": "Max 5x",
+                "limits": [
+                    {"label": "Session (5-hour)", "percent": 0.10, "resetsAt": ""},
+                    {"label": "Weekly (7-day)", "percent": 0.02, "resetsAt": ""},
+                ],
+            }
+            with patch("claude_usage_scanner.query_agent_collector_record", return_value=canned) as mock_query:
                 data = fetch_claude_usage_quota(pdir, force=True)
                 self.assertEqual(mock_query.call_count, 1)
                 self.assertEqual(len(data["groups"]), 1)
+                self.assertEqual(data["tierLabel"], "Max 5x")
 
                 cache_file = pdir / "cache" / "claude_usage_quota_cache.json"
                 self.assertTrue(cache_file.exists())
@@ -278,16 +319,19 @@ class TestClaudeUsageScanner(unittest.TestCase):
 
     def test_scan_contract(self):
         from unittest.mock import patch
-        canned = (
-            "Current session: 10% used · resets Sep 18, 8pm (Australia/Perth)\n"
-            "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)"
-        )
+        canned = {
+            "tierLabel": "Pro",
+            "limits": [
+                {"label": "Session (5-hour)", "percent": 0.10, "resetsAt": ""},
+                {"label": "Weekly (7-day)", "percent": 0.02, "resetsAt": ""},
+            ],
+        }
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
             cache_dir = base_dir / "cache"
             cache_dir.mkdir(parents=True)
 
-            with patch("claude_usage_scanner.query_usage_text", return_value=canned):
+            with patch("claude_usage_scanner.query_agent_collector_record", return_value=canned):
                 data = scan(base_dir, force=False)
 
             self.assertEqual(data["schemaVersion"], 1)
@@ -300,11 +344,12 @@ class TestClaudeUsageScanner(unittest.TestCase):
             self.assertIsInstance(data["limits"], list)
             self.assertIn("currentModel", data)
             self.assertEqual(data["currentModel"], "Claude (Default)")
+            self.assertEqual(data["tierLabel"], "Pro")
             self.assertTrue(len(data["limits"]) > 0)
             self.assertIn("burnRatePerHour", data["limits"][0])
             self.assertIn("forecastText", data["limits"][0])
             self.assertIn("forecastStatus", data["limits"][0])
-            # Real percentages from the mocked /usage reply should have come through
+            # Real percentages from the mocked collector record should have come through
             limits_by_group = {l["group"]: l for l in data["limits"]}
             self.assertAlmostEqual(limits_by_group["session"]["percent"], 0.10, places=2)
             self.assertAlmostEqual(limits_by_group["weekly"]["percent"], 0.02, places=2)
@@ -318,17 +363,18 @@ class TestClaudeUsageScanner(unittest.TestCase):
             self.assertIn("lastFullRefreshMs", data)
             self.assertTrue(data["lastFullRefreshMs"] > 0)
 
-    def test_scan_contract_without_usage_cli(self):
-        """If `claude -p /usage` is unavailable, scan() must still return the full contract."""
+    def test_scan_contract_without_agent_collector(self):
+        """If omarchy-agent-usage-claude is unavailable, scan() must still return the full contract."""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
             (base_dir / "cache").mkdir(parents=True)
 
-            with patch("claude_usage_scanner.query_usage_text", return_value=None):
+            with patch("claude_usage_scanner.query_agent_collector_record", return_value=None):
                 data = scan(base_dir, force=False)
 
             self.assertTrue(data["ready"])
+            self.assertEqual(data["tierLabel"], "Anthropic")
             self.assertEqual(len(data["limits"]), 2)
             self.assertEqual(data["limits"][0]["percent"], 0.0)
 

@@ -16,7 +16,6 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 
 def default_base_dir() -> Path:
@@ -718,109 +717,113 @@ def record_quota_success(base_dir: Path) -> None:
         pass
 
 
-_USAGE_LINE_RE = re.compile(
-    r"(Current session|Current week[^:\n]*):\s*"
-    r"(\d+(?:\.\d+)?)%\s*used"
-    r"(?:\s*\xb7\s*resets\s+([A-Za-z]{3,9}\s+\d{1,2}),\s*(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\))?",
-    re.IGNORECASE
-)
+def resolve_agent_collector_bin() -> str:
+    """Resolve Omarchy's own first-party Claude usage collector.
 
-
-def resolve_claude_bin() -> str:
-    return os.environ.get("CLAUDE_USAGE_CLI") or shutil.which("claude") or "claude"
-
-
-def _parse_usage_reset_time(date_part: str, time_part: str, tz_name: str, now: dt.datetime | None = None) -> str:
-    """Turn '(Sep 18, 8pm, Australia/Perth)'-style fragments into an ISO 8601 UTC timestamp."""
-    if not date_part or not time_part or not tz_name:
-        return ""
-    try:
-        tz = ZoneInfo(tz_name.strip())
-    except Exception:
-        return ""
-
-    time_clean = time_part.strip().lower().replace(" ", "")
-    fmt = "%I:%M%p" if ":" in time_clean else "%I%p"
-    try:
-        parsed_time = dt.datetime.strptime(time_clean, fmt)
-    except Exception:
-        return ""
-
-    now_utc = now or dt.datetime.now(dt.timezone.utc)
-    now_local = now_utc.astimezone(tz)
-
-    try:
-        parsed_date = dt.datetime.strptime(f"{date_part.strip()} {now_local.year}", "%b %d %Y")
-    except Exception:
-        return ""
-
-    combined = dt.datetime(
-        parsed_date.year, parsed_date.month, parsed_date.day,
-        parsed_time.hour, parsed_time.minute, tzinfo=tz
-    )
-    # Reset times are always near-future; a result more than a day in the past means the
-    # year rolled over (e.g. checking in late December for an early-January reset).
-    if combined < now_local - dt.timedelta(days=1):
-        combined = combined.replace(year=combined.year + 1)
-
-    return combined.astimezone(dt.timezone.utc).isoformat()
-
-
-def parse_usage_output(text: str) -> dict[str, Any]:
-    """Parse the plain-text `result` field of `claude -p /usage --output-format json` into
-    the same {"groups": [...]} shape `fetch_agy_usage_quota` used to return for Antigravity.
+    `omarchy-agent-usage-claude` ships with Omarchy (it backs the built-in Agents panel) and
+    hits Anthropic's authoritative OAuth usage endpoint directly using the access token from
+    `~/.claude/.credentials.json` — real per-window percentages and reset times, including any
+    model-scoped limits (e.g. an Opus-only weekly cap), with no text-scraping involved.
     """
-    buckets: list[dict[str, Any]] = []
-    for m in _USAGE_LINE_RE.finditer(text or ""):
-        label_raw, pct_str, date_part, time_part, tz_name = m.groups()
-        is_weekly = label_raw.strip().lower().startswith("current week")
-        bucket_id = "weekly" if is_weekly else "session"
+    return os.environ.get("CLAUDE_USAGE_AGENT_COLLECTOR") or shutil.which("omarchy-agent-usage-claude") or "omarchy-agent-usage-claude"
 
+
+def _slugify(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.strip().lower()).strip("-")
+    return slug or "limit"
+
+
+def query_agent_collector_record(collector_bin: str, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Run `omarchy-agent-usage-claude --limits-only` and return its parsed JSON record, or
+    None on failure. `--limits-only` tells the collector it may reuse a recent local transcript
+    scan; only the limits probe against Anthropic's usage endpoint needs to be fresh.
+    """
+    try:
+        res = subprocess.run(
+            [collector_bin, "--limits-only"],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if res.returncode != 0:
+            return None
+        record = json.loads(res.stdout)
+        return record if isinstance(record, dict) else None
+    except Exception:
+        return None
+
+
+def parse_agent_collector_limits(record: dict[str, Any]) -> dict[str, Any]:
+    """Turn the collector's `limits` array (`[{"label","percent","resetsAt"}, ...]`) into the
+    same {"groups": [...]} shape the rest of the quota pipeline (burn rate, forecast, caching)
+    already expects. `percent` is the fraction of the window already used (0..1).
+    """
+    entries = record.get("limits") if isinstance(record, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return {"groups": []}
+
+    buckets: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = sanitize_plain_text(entry.get("label") or entry.get("title") or "", 100)
+        if not label:
+            continue
         try:
-            pct_used = float(pct_str)
+            percent_used = float(entry.get("percent"))
         except (TypeError, ValueError):
             continue
-        remaining_fraction = max(0.0, min(1.0, 1.0 - pct_used / 100.0))
+        remaining_fraction = max(0.0, min(1.0, 1.0 - percent_used))
+
+        # Only the plain "Session (5-hour)" / "Weekly (7-day)" / "Monthly (...)" labels the
+        # collector always reports get the generic id — matched by their fixed leading word, not
+        # by substring, so a model-scoped label like "Opus Weekly" (model name first) gets its
+        # own slug instead of colliding with the generic weekly bucket.
+        label_lower = label.lower()
+        if label_lower.startswith("session"):
+            bucket_id, window = "session", "session"
+        elif label_lower.startswith("week"):
+            bucket_id, window = "weekly", "weekly"
+        elif label_lower.startswith("month"):
+            bucket_id, window = "monthly", "monthly"
+        else:
+            bucket_id = _slugify(label)
+            if "week" in label_lower:
+                window = "weekly"
+            elif "month" in label_lower:
+                window = "monthly"
+            elif "session" in label_lower or "hour" in label_lower:
+                window = "session"
+            else:
+                window = ""
+
+        # Two distinct scoped limits can still collide on their slug (rare) — disambiguate
+        # instead of silently dropping one.
+        base_id, n = bucket_id, 2
+        while bucket_id in seen_ids:
+            bucket_id = f"{base_id}-{n}"
+            n += 1
+        seen_ids.add(bucket_id)
 
         buckets.append({
             "id": bucket_id,
-            "name": f"{'Weekly' if is_weekly else 'Session'} Limit Remaining",
-            "window": "weekly" if is_weekly else "session",
+            "name": label,
+            "window": window,
             "remaining_fraction": remaining_fraction,
-            "reset_time": _parse_usage_reset_time(date_part, time_part, tz_name),
-            "description": "Weekly rolling quota" if is_weekly else "Current session window"
+            "reset_time": sanitize_plain_text(entry.get("resetsAt") or "", 60),
+            "description": label
         })
 
     if not buckets:
         return {"groups": []}
 
-    return {"groups": [{
-        "name": "Claude Usage",
-        "description": "Reported by `claude -p /usage`",
-        "buckets": buckets
-    }]}
-
-
-def query_usage_text(claude_bin: str, timeout: float = 15.0) -> str | None:
-    """Run `claude -p /usage` non-interactively. Returns the reply text, or None on failure.
-
-    Uses --no-session-persistence so this polling call doesn't leave a stray session/transcript
-    behind, and --output-format json so the reply is easy to extract without any TTY rendering.
-    This is a local command (no model turn is billed): it resolves in well under a second.
-    """
-    try:
-        res = subprocess.run(
-            [claude_bin, "-p", "/usage", "--output-format", "json", "--no-session-persistence"],
-            capture_output=True, text=True, timeout=timeout
-        )
-        if res.returncode != 0:
-            return None
-        payload = json.loads(res.stdout)
-        if payload.get("is_error"):
-            return None
-        return payload.get("result") or ""
-    except Exception:
-        return None
+    return {
+        "groups": [{
+            "name": "Claude Usage",
+            "description": "From Omarchy's omarchy-agent-usage-claude collector",
+            "buckets": buckets
+        }],
+        "tierLabel": sanitize_plain_text(record.get("tierLabel") or "", 40)
+    }
 
 
 def bg_refresh_quota(base_dir: Path) -> None:
@@ -828,9 +831,9 @@ def bg_refresh_quota(base_dir: Path) -> None:
     cache_path = base_dir / "cache" / "claude_usage_quota_cache.json"
     flag_file = base_dir / "cache" / "claude_usage_quota_refresh.flag"
     try:
-        text = query_usage_text(resolve_claude_bin())
-        if text is not None:
-            parsed = parse_usage_output(text)
+        record = query_agent_collector_record(resolve_agent_collector_bin())
+        if record is not None:
+            parsed = parse_agent_collector_limits(record)
             if parsed.get("groups"):
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp_cache = cache_path.with_suffix(".tmp")
@@ -839,7 +842,9 @@ def bg_refresh_quota(base_dir: Path) -> None:
                 tmp_cache.replace(cache_path)
                 record_quota_success(base_dir)
                 return
-        record_quota_failure(base_dir, "claude -p /usage failed or was unparsable")
+            record_quota_failure(base_dir, record.get("authHelpText") or "omarchy-agent-usage-claude returned no limits")
+            return
+        record_quota_failure(base_dir, "omarchy-agent-usage-claude failed or timed out")
     except Exception as e:
         record_quota_failure(base_dir, str(e))
     finally:
@@ -879,11 +884,12 @@ def trigger_bg_quota_refresh(base_dir: Path) -> None:
 
 
 def fetch_claude_usage_quota(base_dir: Path, force: bool = False) -> dict[str, Any]:
-    """Fetch session/weekly quota via `claude -p /usage`, with caching and failure backoff.
+    """Fetch session/weekly (and any model-scoped) quota via Omarchy's own
+    `omarchy-agent-usage-claude --limits-only` collector, with caching and failure backoff.
 
-    Mirrors the original agy `/usage` fetch strategy: serve a short-lived cache instantly,
-    kick off a detached background refresh once it goes stale (>180s), and only block the
-    caller on a synchronous query when there is no cache yet or a refresh was forced.
+    Serves a short-lived cache instantly, kicks off a detached background refresh once it goes
+    stale (>180s), and only blocks the caller on a synchronous query when there is no cache yet
+    or a refresh was forced.
     """
     cache_path = base_dir / "cache" / "claude_usage_quota_cache.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -916,9 +922,9 @@ def fetch_claude_usage_quota(base_dir: Path, force: bool = False) -> dict[str, A
             return {}
 
     # 3. Synchronous query (first run, forced refresh, or cache missing and not in backoff)
-    text = query_usage_text(resolve_claude_bin())
-    if text is not None:
-        parsed = parse_usage_output(text)
+    record = query_agent_collector_record(resolve_agent_collector_bin())
+    if record is not None:
+        parsed = parse_agent_collector_limits(record)
         if parsed.get("groups"):
             try:
                 tmp_cache = cache_path.with_suffix(".tmp")
@@ -929,9 +935,9 @@ def fetch_claude_usage_quota(base_dir: Path, force: bool = False) -> dict[str, A
             except Exception:
                 pass
             return parsed
-        record_quota_failure(base_dir, "claude -p /usage output did not match the expected format")
+        record_quota_failure(base_dir, record.get("authHelpText") or "omarchy-agent-usage-claude returned no limits")
     else:
-        record_quota_failure(base_dir, "claude -p /usage failed or timed out")
+        record_quota_failure(base_dir, "omarchy-agent-usage-claude failed or timed out")
 
     # 4. Fallback to stale cache if present
     if cache_path.exists():
@@ -946,13 +952,17 @@ def fetch_claude_usage_quota(base_dir: Path, force: bool = False) -> dict[str, A
     return {}
 
 
+_BUCKET_LABELS = {"weekly": "Weekly Limit", "session": "Session Limit", "monthly": "Monthly Limit"}
+_BUCKET_ORDER = {"weekly": 0, "session": 1}
+
+
 def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) -> list[dict[str, Any]]:
     """Format quota group and bucket metrics for QML consumption with burn rate and forecast.
 
-    `raw_data` normally comes from `fetch_claude_usage_quota`, which parses the real
-    session/weekly percentages out of `claude -p /usage`. This placeholder is only used
-    before the first successful query completes, or if it keeps failing (e.g. the `claude`
-    binary isn't on PATH).
+    `raw_data` normally comes from `fetch_claude_usage_quota`, which reads the real limits
+    (session, weekly, and any model-scoped windows) straight from Omarchy's own
+    `omarchy-agent-usage-claude` collector. This placeholder is only used before the first
+    successful query completes, or if it keeps failing (e.g. `claude auth login` is needed).
     """
     groups = raw_data.get("groups", [])
     burn_rates = {}
@@ -963,7 +973,7 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
         return [
             {
                 "name": "Claude Usage",
-                "description": "Reported by `claude -p /usage`",
+                "description": "From Omarchy's omarchy-agent-usage-claude collector",
                 "color": "#D97757",
                 "buckets": [
                     {
@@ -979,7 +989,7 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                         "color": "#D97757",
                         "burnRatePerHour": 0.0,
                         "burnRateText": "",
-                        "forecastText": "Waiting on first /usage check…",
+                        "forecastText": "Waiting on first check…",
                         "forecastStatus": "stable"
                     },
                     {
@@ -995,7 +1005,7 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                         "color": "#D97757",
                         "burnRatePerHour": 0.0,
                         "burnRateText": "",
-                        "forecastText": "Waiting on first /usage check…",
+                        "forecastText": "Waiting on first check…",
                         "forecastStatus": "stable"
                     }
                 ]
@@ -1018,7 +1028,10 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
             used_pct = 100 - rem_pct
             reset_time = sanitize_plain_text(b.get("reset_time", ""), 60)
 
-            label = "Weekly Limit" if "weekly" in b_win.lower() or "weekly" in b_name.lower() else "Session Limit"
+            # The generic Session/Weekly/Monthly buckets get a fixed display label; anything
+            # else (a model-scoped limit like "Opus Weekly") keeps its own descriptive name so
+            # it doesn't collide visually with the generic bucket for the same window.
+            label = _BUCKET_LABELS.get(b_id, b_name)
 
             burn_rate = burn_rates.get(b_id, 0.0)
             burn_text, forecast_text, forecast_status = compute_bucket_forecast(rem_pct, burn_rate, reset_time)
@@ -1040,8 +1053,8 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                 "forecastStatus": forecast_status
             })
 
-        # Show the Weekly Limit above the Session Limit, regardless of the order /usage reported them in
-        buckets.sort(key=lambda b: 0 if b["label"] == "Weekly Limit" else 1)
+        # Weekly, then Session, then any model-scoped limits in the order the collector gave them
+        buckets.sort(key=lambda b: _BUCKET_ORDER.get(b["id"], 2))
 
         formatted.append({
             "name": g_name,
@@ -1234,9 +1247,10 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         projects_dir, today_str, recent_dates, default_model=configured_model, base_dir=base_dir
     )
 
-    # 4. Fetch real quota data via `claude -p /usage` (cached, with background refresh)
+    # 4. Fetch real quota data via omarchy-agent-usage-claude (cached, with background refresh)
     raw_quota = fetch_claude_usage_quota(base_dir, force=force)
     quota_groups = format_quota_groups(raw_quota, base_dir=base_dir)
+    tier_label = sanitize_plain_text(raw_quota.get("tierLabel") or "", 40) or "Anthropic"
 
     if alert_threshold is not None:
         check_and_send_quota_notifications(base_dir, quota_groups, threshold_pct=alert_threshold)
@@ -1458,7 +1472,7 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         "activeStatus": active_status,
         "hasActiveSession": has_active_session,
         "hasLocalStats": True,
-        "tierLabel": "Anthropic",
+        "tierLabel": tier_label,
         "currentModel": clean_latest_model,
         "todayPrompts": daily_prompts.get(today_str, 0),
         "todaySessions": today_db_sessions or (1 if has_active_session else 0),

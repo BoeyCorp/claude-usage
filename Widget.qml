@@ -216,6 +216,7 @@ BarWidget {
     settingsStatusText = ""
     settingsMode = true
     popupOpen = true
+    if (root.provider) root.provider.checkHooks()
     if (flick) flick.contentY = 0
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
@@ -1818,6 +1819,64 @@ BarWidget {
           enabled: root.draftValue("enableQuotaAlerts", true) !== false
           opacity: enabled ? 1.0 : 0.45
           onModified: function(value) { root.setDraftValue("quotaAlertThreshold", value) }
+        }
+      }
+    }
+
+    SectionCard {
+      title: "Live Hook Updates"
+      subtitle: "Refresh the bar instantly on session events, instead of only on a timer"
+
+      ColumnLayout {
+        width: parent.width
+        spacing: 8
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          wrapMode: Text.WordWrap
+          text: {
+            if (!root.provider || !root.provider.hooksKnown) return "Checking…"
+            return root.provider.hooksInstalled
+              ? "Installed — SessionStart, UserPromptSubmit, Stop, Notification, PermissionRequest, and SessionEnd ping this widget the moment they fire."
+              : "Not installed — the widget only updates on its refresh interval."
+          }
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: 10
+        }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: 8
+
+          Button {
+            text: (root.provider && root.provider.hooksInstalled) ? "Remove hooks" : "Install hooks"
+            foreground: root.foreground
+            tooltipText: (root.provider && root.provider.hooksInstalled)
+              ? "Remove these hook entries from ~/.claude/settings.json (a backup is written first)"
+              : "Add hook entries to ~/.claude/settings.json (a backup is written first)"
+            tooltipBackground: root.background
+            tooltipForeground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: 10
+            horizontalPadding: 8
+            verticalPadding: 4
+            enabled: !!root.provider && !root.provider.hooksBusy
+            onClicked: {
+              if (root.provider.hooksInstalled) root.provider.removeHooks()
+              else root.provider.installHooks()
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: !!root.provider && root.provider.hooksBusy
+            text: "working…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: 9
+          }
         }
       }
     }
