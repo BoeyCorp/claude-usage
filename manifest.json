@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "boeycorp.claude-usage",
+  "name": "Claude Usage",
+  "version": "1.0.0",
+  "author": "BoeyCorp & contributors",
+  "license": "MIT",
+  "description": "Claude Code active sessions, quota limits card, model breakdown, prompt history, and tool telemetry in the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Claude Usage",
+    "description": "Shows Claude Code active agent status, sessions, prompt stats, and tool usage.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "badgeMode": "active",
+      "showBadge": true,
+      "enableQuotaAlerts": true,
+      "quotaAlertThreshold": 15,
+      "terminalCommand": "",
+      "recentSessionsLimit": 5
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 10,
+        "max": 1800,
+        "step": 10,
+        "defaultValue": 60
+      },
+      {
+        "key": "badgeMode",
+        "type": "enum",
+        "label": "Bar badge mode",
+        "options": ["active", "prompts", "off"],
+        "defaultValue": "active"
+      },
+      {
+        "key": "showBadge",
+        "type": "boolean",
+        "label": "Show count badge in bar",
+        "defaultValue": true
+      },
+      {
+        "key": "enableQuotaAlerts",
+        "type": "boolean",
+        "label": "Low quota desktop alerts",
+        "defaultValue": true
+      },
+      {
+        "key": "quotaAlertThreshold",
+        "type": "integer",
+        "label": "Low quota alert threshold (%)",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "terminalCommand",
+        "type": "string",
+        "label": "Terminal emulator override",
+        "defaultValue": ""
+      },
+      {
+        "key": "recentSessionsLimit",
+        "type": "integer",
+        "label": "Default recent sessions count",
+        "min": 3,
+        "max": 10,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

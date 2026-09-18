@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Claude Code usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Claude Code usage into one display-ready JSON record for Omarchy.
+
+Emits the record contract expected by omarchy-agent-usage-update and the
+omarchy.agents bar panel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import sys
+from pathlib import Path
+
+# Add scripts directory to path to import scanner engine
+current_dir = Path(__file__).resolve().parent
+scripts_dir = current_dir.parent / "scripts"
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+try:
+    from claude_usage_scanner import scan, default_base_dir
+except ImportError:
+    sys.path.insert(0, str(current_dir))
+    from claude_usage_scanner import scan, default_base_dir
+
+
+def collect(base_dir: Path, force: bool = False) -> dict:
+    data = scan(base_dir, force=force)
+
+    # Compute active days & active dates for Omarchy panel contract
+    all_dates = set()
+    for d in data.get("recentDays", []):
+        if d.get("prompts", 0) > 0 or d.get("messageCount", 0) > 0:
+            all_dates.add(d.get("date"))
+
+    return {
+        "schemaVersion": 1,
+        "id": "claude",
+        "name": "Claude Code",
+        "updatedAt": data.get("updatedAt", dt.datetime.now(dt.timezone.utc).isoformat()),
+        "ready": data.get("ready", False),
+        "hasLocalStats": data.get("hasLocalStats", False),
+        "todayPrompts": data.get("todayPrompts", 0),
+        "todaySessions": data.get("todaySessions", 0),
+        "todayTotalTokens": data.get("todayTotalTokens", 0),
+        "todayTokensByModel": data.get("todayTokensByModel", {}),
+        "recentDays": data.get("recentDays", []),
+        "totalPrompts": data.get("totalPrompts", 0),
+        "totalSessions": data.get("totalSessions", 0),
+        "activeDays": len(all_dates),
+        "activeDates": sorted(list(all_dates)),
+        "modelUsage": data.get("modelUsage", {}),
+        "limits": data.get("limits", []),
+        "tierLabel": data.get("tierLabel", "Anthropic"),
+        "usageStatusText": data.get("usageStatusText", ""),
+        "authHelpText": data.get("authHelpText", "")
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Claude Code Usage Collector for Omarchy")
+    parser.add_argument("--force", action="store_true", help="Bypass cache and force refresh")
+    parser.add_argument("--limits-only", action="store_true", help="Emit limits array only")
+    args = parser.parse_args()
+
+    record = collect(default_base_dir(), force=args.force)
+    if args.limits_only:
+        print(json.dumps(record.get("limits", []), indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(record, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
