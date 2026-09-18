@@ -967,22 +967,6 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                 "color": "#D97757",
                 "buckets": [
                     {
-                        "id": "session",
-                        "name": "Session Limit Remaining",
-                        "label": "Session Limit",
-                        "window": "session",
-                        "remainingFraction": 1.0,
-                        "remainingPercent": 100,
-                        "usedPercent": 0,
-                        "resetTime": "",
-                        "description": "Current session window",
-                        "color": "#D97757",
-                        "burnRatePerHour": 0.0,
-                        "burnRateText": "",
-                        "forecastText": "Waiting on first /usage check…",
-                        "forecastStatus": "stable"
-                    },
-                    {
                         "id": "weekly",
                         "name": "Weekly Limit Remaining",
                         "label": "Weekly Limit",
@@ -992,6 +976,22 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                         "usedPercent": 0,
                         "resetTime": "",
                         "description": "Weekly rolling quota",
+                        "color": "#D97757",
+                        "burnRatePerHour": 0.0,
+                        "burnRateText": "",
+                        "forecastText": "Waiting on first /usage check…",
+                        "forecastStatus": "stable"
+                    },
+                    {
+                        "id": "session",
+                        "name": "Session Limit Remaining",
+                        "label": "Session Limit",
+                        "window": "session",
+                        "remainingFraction": 1.0,
+                        "remainingPercent": 100,
+                        "usedPercent": 0,
+                        "resetTime": "",
+                        "description": "Current session window",
                         "color": "#D97757",
                         "burnRatePerHour": 0.0,
                         "burnRateText": "",
@@ -1039,6 +1039,9 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                 "forecastText": forecast_text,
                 "forecastStatus": forecast_status
             })
+
+        # Show the Weekly Limit above the Session Limit, regardless of the order /usage reported them in
+        buckets.sort(key=lambda b: 0 if b["label"] == "Weekly Limit" else 1)
 
         formatted.append({
             "name": g_name,
