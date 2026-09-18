@@ -34,12 +34,12 @@ This is a fork of [antigravity-usage](https://github.com/BoeyCorp/antigravity-us
 - **Consistent Metrics**: Clean, uniform `X prompts · Y steps` formatting across all models and timeframes.
 - **Real Token Counts**: Today's token usage (input + output + cache) is aggregated directly from local transcript `usage` blocks, broken down per model.
 
-### 4. Quota Limits Card
-- **Session & Weekly Buckets**: Mirrors the same 5-hour session / weekly limit structure Claude subscriptions use.
-- **Burn Rate & Reset Forecasting Engine**: The same hourly burn-rate tracking (`🔥 X%/h`) and reset-pacing forecast logic as the original project, ready to drive real numbers if Anthropic exposes a local usage API in the future.
+### 4. Quota Limits, Burn Rate & Desktop Alerts
+- **Real-Time Quota Buckets**: Live quota information fetched from `claude -p /usage --output-format json --no-session-persistence` (Claude Code's own local `/usage` command), covering the Current Session and Current Week (all models) limits your subscription actually reports.
+- **Burn Rate Velocity & Reset Forecasting**: Real-time hourly consumption tracking (`🔥 X%/h`) and intelligent reset pacing projections (`On pace · ~65% at reset` or early warnings `Depletes in ~2.0h before reset`), computed the same way as the original project from timestamped local snapshots.
+- **Dual Reset Time Display**: Shows both relative countdown timers (e.g. `2h 15m`) and exact local wall-clock times (e.g. `04:15 AM`), parsed from `/usage`'s human-readable reset time (e.g. `resets Sep 18, 8pm (Australia/Perth)`) into a real timezone-aware timestamp.
 - **Configurable Low Quota Alerts**: Toggle desktop notifications on/off and configure custom remaining percentage thresholds (5% to 50%, default 15%) via `omarchy-notification-send`.
-
-> **Note:** Unlike Google Antigravity's `agy -p /usage` CLI, Claude Code does not currently expose a local, scriptable API for real-time subscription quota. The Quota Limits card therefore shows a static placeholder (with a pointer to run `/usage` inside an interactive Claude Code session for the real numbers) instead of live percentages. The underlying burn-rate/forecast engine is fully implemented and will activate automatically if Anthropic ships a queryable usage endpoint.
+- **Cheap & Cached**: `/usage` is a local Claude Code command — it resolves in well under a second and doesn't spend any API/model quota itself. The scanner caches the result, serves it instantly on every poll, and only re-queries in a detached background process once the cache is older than 3 minutes (with exponential backoff on failures), so the bar widget never blocks waiting on it.
 
 ### 5. Performance & Telemetry
 - **Sub-50ms High Performance**: Incremental transcript caching indexed by file modification time and size keeps full telemetry and session scans fast even with dozens of past sessions.
@@ -59,8 +59,8 @@ This is a fork of [antigravity-usage](https://github.com/BoeyCorp/antigravity-us
 
 ## Requirements
 
-- Python 3 (standard library only: `json`, `datetime`, `pathlib`, `collections`, `subprocess`, `signal`, `fcntl`)
-- [Claude Code](https://claude.com/product/claude-code) CLI with local session data in `~/.claude`
+- Python 3.9+ (standard library only: `json`, `datetime`, `pathlib`, `collections`, `subprocess`, `signal`, `fcntl`, `zoneinfo`)
+- [Claude Code](https://claude.com/product/claude-code) CLI (`claude`) on `PATH`, logged in, with local session data in `~/.claude` — the Quota Limits card shells out to `claude -p /usage` for real numbers
 - Omarchy Shell / Quickshell
 
 ---
@@ -152,6 +152,13 @@ Configuration lives in `~/.config/omarchy/shell.json` or can be adjusted directl
 | `quotaAlertThreshold` | integer (5–50) | `15` | Low quota percentage alert threshold |
 | `terminalCommand` | string | `""` | Terminal emulator command override (`foot`, `ghostty`, `kitty`, `alacritty`, or blank for `xdg-terminal-exec`) |
 | `recentSessionsLimit` | integer (3–10) | `5` | Initial number of recent sessions to display before expanding |
+
+Two environment variables are also honored by the scanner script itself (not exposed in the settings UI):
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLAUDE_USAGE_DATA_DIR` | `~/.claude` | Override the Claude Code data directory the scanner reads |
+| `CLAUDE_USAGE_CLI` | first `claude` on `PATH` | Override the `claude` binary used for the `/usage` quota query |
 
 ---
 

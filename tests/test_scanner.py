@@ -25,6 +25,8 @@ from claude_usage_scanner import (
     format_hours_duration,
     normalize_timestamp_seconds,
     parse_transcripts,
+    parse_usage_output,
+    fetch_claude_usage_quota,
     check_and_send_quota_notifications,
     get_quota_backoff,
     record_quota_failure,
@@ -229,13 +231,64 @@ class TestClaudeUsageScanner(unittest.TestCase):
                 except Exception:
                     pass
 
+    def test_parse_usage_output(self):
+        text = (
+            "You are currently using your subscription to power your Claude Code usage\n\n"
+            "Current session: 11% used · resets Sep 18, 8pm (Australia/Perth)\n"
+            "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)\n\n"
+            "What's contributing to your limits usage?"
+        )
+        parsed = parse_usage_output(text)
+        self.assertEqual(len(parsed["groups"]), 1)
+        buckets = {b["id"]: b for b in parsed["groups"][0]["buckets"]}
+        self.assertIn("session", buckets)
+        self.assertIn("weekly", buckets)
+        self.assertAlmostEqual(buckets["session"]["remaining_fraction"], 0.89)
+        self.assertAlmostEqual(buckets["weekly"]["remaining_fraction"], 0.98)
+        # Perth (UTC+8, no DST): 8pm -> 12:00 UTC, 12pm -> 04:00 UTC
+        self.assertTrue(buckets["session"]["reset_time"].startswith("20"))
+        self.assertIn("T12:00:00", buckets["session"]["reset_time"])
+        self.assertIn("T04:00:00", buckets["weekly"]["reset_time"])
+
+    def test_parse_usage_output_no_match(self):
+        parsed = parse_usage_output("some unrelated text with no usage lines")
+        self.assertEqual(parsed, {"groups": []})
+
+    def test_fetch_claude_usage_quota_uses_query_and_caches(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdir = Path(tmpdir)
+            canned = (
+                "Current session: 10% used · resets Sep 18, 8pm (Australia/Perth)\n"
+                "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)"
+            )
+            with patch("claude_usage_scanner.query_usage_text", return_value=canned) as mock_query:
+                data = fetch_claude_usage_quota(pdir, force=True)
+                self.assertEqual(mock_query.call_count, 1)
+                self.assertEqual(len(data["groups"]), 1)
+
+                cache_file = pdir / "cache" / "claude_usage_quota_cache.json"
+                self.assertTrue(cache_file.exists())
+
+                # A non-forced call within the cache TTL should serve from disk, not re-query
+                mock_query.reset_mock()
+                data2 = fetch_claude_usage_quota(pdir, force=False)
+                self.assertEqual(mock_query.call_count, 0)
+                self.assertEqual(data2["groups"][0]["buckets"], data["groups"][0]["buckets"])
+
     def test_scan_contract(self):
+        from unittest.mock import patch
+        canned = (
+            "Current session: 10% used · resets Sep 18, 8pm (Australia/Perth)\n"
+            "Current week (all models): 2% used · resets Sep 23, 12pm (Australia/Perth)"
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
             cache_dir = base_dir / "cache"
             cache_dir.mkdir(parents=True)
 
-            data = scan(base_dir, force=False)
+            with patch("claude_usage_scanner.query_usage_text", return_value=canned):
+                data = scan(base_dir, force=False)
 
             self.assertEqual(data["schemaVersion"], 1)
             self.assertEqual(data["id"], "claude")
@@ -251,13 +304,33 @@ class TestClaudeUsageScanner(unittest.TestCase):
             self.assertIn("burnRatePerHour", data["limits"][0])
             self.assertIn("forecastText", data["limits"][0])
             self.assertIn("forecastStatus", data["limits"][0])
+            # Real percentages from the mocked /usage reply should have come through
+            limits_by_group = {l["group"]: l for l in data["limits"]}
+            self.assertAlmostEqual(limits_by_group["session"]["percent"], 0.10, places=2)
+            self.assertAlmostEqual(limits_by_group["weekly"]["percent"], 0.02, places=2)
             # Verify recentDays entries include 'steps' field
             self.assertIn("recentDays", data)
             self.assertTrue(len(data["recentDays"]) > 0)
             for day_entry in data["recentDays"]:
                 self.assertIn("steps", day_entry)
             self.assertIn("quotaUpdatedAt", data)
+            self.assertTrue(len(data["quotaUpdatedAt"]) > 0)
             self.assertIn("lastFullRefreshMs", data)
+            self.assertTrue(data["lastFullRefreshMs"] > 0)
+
+    def test_scan_contract_without_usage_cli(self):
+        """If `claude -p /usage` is unavailable, scan() must still return the full contract."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            (base_dir / "cache").mkdir(parents=True)
+
+            with patch("claude_usage_scanner.query_usage_text", return_value=None):
+                data = scan(base_dir, force=False)
+
+            self.assertTrue(data["ready"])
+            self.assertEqual(len(data["limits"]), 2)
+            self.assertEqual(data["limits"][0]["percent"], 0.0)
 
     def test_quota_notifications_cooldown_and_consolidation(self):
         from unittest.mock import patch

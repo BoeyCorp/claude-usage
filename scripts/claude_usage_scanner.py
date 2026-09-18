@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 def default_base_dir() -> Path:
@@ -716,12 +718,241 @@ def record_quota_success(base_dir: Path) -> None:
         pass
 
 
+_USAGE_LINE_RE = re.compile(
+    r"(Current session|Current week[^:\n]*):\s*"
+    r"(\d+(?:\.\d+)?)%\s*used"
+    r"(?:\s*\xb7\s*resets\s+([A-Za-z]{3,9}\s+\d{1,2}),\s*(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\))?",
+    re.IGNORECASE
+)
+
+
+def resolve_claude_bin() -> str:
+    return os.environ.get("CLAUDE_USAGE_CLI") or shutil.which("claude") or "claude"
+
+
+def _parse_usage_reset_time(date_part: str, time_part: str, tz_name: str, now: dt.datetime | None = None) -> str:
+    """Turn '(Sep 18, 8pm, Australia/Perth)'-style fragments into an ISO 8601 UTC timestamp."""
+    if not date_part or not time_part or not tz_name:
+        return ""
+    try:
+        tz = ZoneInfo(tz_name.strip())
+    except Exception:
+        return ""
+
+    time_clean = time_part.strip().lower().replace(" ", "")
+    fmt = "%I:%M%p" if ":" in time_clean else "%I%p"
+    try:
+        parsed_time = dt.datetime.strptime(time_clean, fmt)
+    except Exception:
+        return ""
+
+    now_utc = now or dt.datetime.now(dt.timezone.utc)
+    now_local = now_utc.astimezone(tz)
+
+    try:
+        parsed_date = dt.datetime.strptime(f"{date_part.strip()} {now_local.year}", "%b %d %Y")
+    except Exception:
+        return ""
+
+    combined = dt.datetime(
+        parsed_date.year, parsed_date.month, parsed_date.day,
+        parsed_time.hour, parsed_time.minute, tzinfo=tz
+    )
+    # Reset times are always near-future; a result more than a day in the past means the
+    # year rolled over (e.g. checking in late December for an early-January reset).
+    if combined < now_local - dt.timedelta(days=1):
+        combined = combined.replace(year=combined.year + 1)
+
+    return combined.astimezone(dt.timezone.utc).isoformat()
+
+
+def parse_usage_output(text: str) -> dict[str, Any]:
+    """Parse the plain-text `result` field of `claude -p /usage --output-format json` into
+    the same {"groups": [...]} shape `fetch_agy_usage_quota` used to return for Antigravity.
+    """
+    buckets: list[dict[str, Any]] = []
+    for m in _USAGE_LINE_RE.finditer(text or ""):
+        label_raw, pct_str, date_part, time_part, tz_name = m.groups()
+        is_weekly = label_raw.strip().lower().startswith("current week")
+        bucket_id = "weekly" if is_weekly else "session"
+
+        try:
+            pct_used = float(pct_str)
+        except (TypeError, ValueError):
+            continue
+        remaining_fraction = max(0.0, min(1.0, 1.0 - pct_used / 100.0))
+
+        buckets.append({
+            "id": bucket_id,
+            "name": f"{'Weekly' if is_weekly else 'Session'} Limit Remaining",
+            "window": "weekly" if is_weekly else "session",
+            "remaining_fraction": remaining_fraction,
+            "reset_time": _parse_usage_reset_time(date_part, time_part, tz_name),
+            "description": "Weekly rolling quota" if is_weekly else "Current session window"
+        })
+
+    if not buckets:
+        return {"groups": []}
+
+    return {"groups": [{
+        "name": "Claude Usage",
+        "description": "Reported by `claude -p /usage`",
+        "buckets": buckets
+    }]}
+
+
+def query_usage_text(claude_bin: str, timeout: float = 15.0) -> str | None:
+    """Run `claude -p /usage` non-interactively. Returns the reply text, or None on failure.
+
+    Uses --no-session-persistence so this polling call doesn't leave a stray session/transcript
+    behind, and --output-format json so the reply is easy to extract without any TTY rendering.
+    This is a local command (no model turn is billed): it resolves in well under a second.
+    """
+    try:
+        res = subprocess.run(
+            [claude_bin, "-p", "/usage", "--output-format", "json", "--no-session-persistence"],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if res.returncode != 0:
+            return None
+        payload = json.loads(res.stdout)
+        if payload.get("is_error"):
+            return None
+        return payload.get("result") or ""
+    except Exception:
+        return None
+
+
+def bg_refresh_quota(base_dir: Path) -> None:
+    """Worker function executed in background to fetch quota without blocking a scan."""
+    cache_path = base_dir / "cache" / "claude_usage_quota_cache.json"
+    flag_file = base_dir / "cache" / "claude_usage_quota_refresh.flag"
+    try:
+        text = query_usage_text(resolve_claude_bin())
+        if text is not None:
+            parsed = parse_usage_output(text)
+            if parsed.get("groups"):
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_cache = cache_path.with_suffix(".tmp")
+                with open(tmp_cache, "w", encoding="utf-8") as f:
+                    json.dump(parsed, f)
+                tmp_cache.replace(cache_path)
+                record_quota_success(base_dir)
+                return
+        record_quota_failure(base_dir, "claude -p /usage failed or was unparsable")
+    except Exception as e:
+        record_quota_failure(base_dir, str(e))
+    finally:
+        try:
+            flag_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def trigger_bg_quota_refresh(base_dir: Path) -> None:
+    """Launch detached background process to refresh quota cache without stalling scans."""
+    in_backoff, _ = get_quota_backoff(base_dir)
+    if in_backoff:
+        return
+
+    flag_file = base_dir / "cache" / "claude_usage_quota_refresh.flag"
+    now = time.time()
+    if flag_file.exists():
+        try:
+            if now - flag_file.stat().st_mtime < 30:
+                return
+        except Exception:
+            pass
+
+    try:
+        flag_file.parent.mkdir(parents=True, exist_ok=True)
+        flag_file.touch()
+        script_path = str(Path(__file__).resolve())
+        subprocess.Popen(
+            [sys.executable, script_path, "--refresh-quota-bg", str(base_dir)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+    except Exception:
+        pass
+
+
+def fetch_claude_usage_quota(base_dir: Path, force: bool = False) -> dict[str, Any]:
+    """Fetch session/weekly quota via `claude -p /usage`, with caching and failure backoff.
+
+    Mirrors the original agy `/usage` fetch strategy: serve a short-lived cache instantly,
+    kick off a detached background refresh once it goes stale (>180s), and only block the
+    caller on a synchronous query when there is no cache yet or a refresh was forced.
+    """
+    cache_path = base_dir / "cache" / "claude_usage_quota_cache.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Read from cache if not forcing refresh
+    if not force and cache_path.exists():
+        try:
+            age = time.time() - cache_path.stat().st_mtime
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data.get("groups"):
+                    if age > 180:
+                        trigger_bg_quota_refresh(base_dir)
+                    return data
+        except Exception:
+            pass
+
+    # 2. If in backoff period and not forcing refresh, do not run synchronous query
+    if not force:
+        in_backoff, _ = get_quota_backoff(base_dir)
+        if in_backoff:
+            if cache_path.exists():
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict) and "groups" in data:
+                            return data
+                except Exception:
+                    pass
+            return {}
+
+    # 3. Synchronous query (first run, forced refresh, or cache missing and not in backoff)
+    text = query_usage_text(resolve_claude_bin())
+    if text is not None:
+        parsed = parse_usage_output(text)
+        if parsed.get("groups"):
+            try:
+                tmp_cache = cache_path.with_suffix(".tmp")
+                with open(tmp_cache, "w", encoding="utf-8") as f:
+                    json.dump(parsed, f)
+                tmp_cache.replace(cache_path)
+                record_quota_success(base_dir)
+            except Exception:
+                pass
+            return parsed
+        record_quota_failure(base_dir, "claude -p /usage output did not match the expected format")
+    else:
+        record_quota_failure(base_dir, "claude -p /usage failed or timed out")
+
+    # 4. Fallback to stale cache if present
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "groups" in data:
+                    return data
+        except Exception:
+            pass
+
+    return {}
+
+
 def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) -> list[dict[str, Any]]:
     """Format quota group and bucket metrics for QML consumption with burn rate and forecast.
 
-    Claude Code does not expose a local, scriptable API for real-time subscription quota
-    (unlike some other agent CLIs), so this always renders the static placeholder structure
-    below. Run `/usage` inside an interactive Claude Code session to check real limits.
+    `raw_data` normally comes from `fetch_claude_usage_quota`, which parses the real
+    session/weekly percentages out of `claude -p /usage`. This placeholder is only used
+    before the first successful query completes, or if it keeps failing (e.g. the `claude`
+    binary isn't on PATH).
     """
     groups = raw_data.get("groups", [])
     burn_rates = {}
@@ -731,28 +962,28 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
     if not groups:
         return [
             {
-                "name": "Claude Models",
-                "description": "Models within this group: Claude Opus, Claude Sonnet, Claude Haiku",
+                "name": "Claude Usage",
+                "description": "Reported by `claude -p /usage`",
                 "color": "#D97757",
                 "buckets": [
                     {
-                        "id": "claude-5h",
-                        "name": "Five Hour Limit Remaining",
-                        "label": "5-Hour Limit",
-                        "window": "5h",
+                        "id": "session",
+                        "name": "Session Limit Remaining",
+                        "label": "Session Limit",
+                        "window": "session",
                         "remainingFraction": 1.0,
                         "remainingPercent": 100,
                         "usedPercent": 0,
                         "resetTime": "",
-                        "description": "5-hour rolling session window",
+                        "description": "Current session window",
                         "color": "#D97757",
                         "burnRatePerHour": 0.0,
                         "burnRateText": "",
-                        "forecastText": "Live tracking unavailable · run /usage in Claude Code",
+                        "forecastText": "Waiting on first /usage check…",
                         "forecastStatus": "stable"
                     },
                     {
-                        "id": "claude-weekly",
+                        "id": "weekly",
                         "name": "Weekly Limit Remaining",
                         "label": "Weekly Limit",
                         "window": "weekly",
@@ -764,7 +995,7 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
                         "color": "#D97757",
                         "burnRatePerHour": 0.0,
                         "burnRateText": "",
-                        "forecastText": "Live tracking unavailable · run /usage in Claude Code",
+                        "forecastText": "Waiting on first /usage check…",
                         "forecastStatus": "stable"
                     }
                 ]
@@ -787,7 +1018,7 @@ def format_quota_groups(raw_data: dict[str, Any], base_dir: Path | None = None) 
             used_pct = 100 - rem_pct
             reset_time = sanitize_plain_text(b.get("reset_time", ""), 60)
 
-            label = "Weekly Limit" if "weekly" in b_win.lower() or "weekly" in b_name.lower() else "5-Hour Limit"
+            label = "Weekly Limit" if "weekly" in b_win.lower() or "weekly" in b_name.lower() else "Session Limit"
 
             burn_rate = burn_rates.get(b_id, 0.0)
             burn_text, forecast_text, forecast_status = compute_bucket_forecast(rem_pct, burn_rate, reset_time)
@@ -1000,9 +1231,9 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         projects_dir, today_str, recent_dates, default_model=configured_model, base_dir=base_dir
     )
 
-    # 4. Quota data: Claude Code has no local API for live subscription limits, so this
-    #    always renders the static placeholder structure (see format_quota_groups docstring).
-    quota_groups = format_quota_groups({}, base_dir=base_dir)
+    # 4. Fetch real quota data via `claude -p /usage` (cached, with background refresh)
+    raw_quota = fetch_claude_usage_quota(base_dir, force=force)
+    quota_groups = format_quota_groups(raw_quota, base_dir=base_dir)
 
     if alert_threshold is not None:
         check_and_send_quota_notifications(base_dir, quota_groups, threshold_pct=alert_threshold)
@@ -1204,6 +1435,17 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
     today_total_tokens = int(sum(today_tokens_by_model.values()))
     today_tokens_by_model_clean = {sanitize_plain_text(k, 80): int(v) for k, v in today_tokens_by_model.items()}
 
+    quota_cache_path = base_dir / "cache" / "claude_usage_quota_cache.json"
+    quota_updated_at = ""
+    quota_updated_ms = 0
+    if quota_cache_path.exists():
+        try:
+            quota_mtime = quota_cache_path.stat().st_mtime
+            quota_updated_at = dt.datetime.fromtimestamp(quota_mtime, tz=dt.timezone.utc).isoformat()
+            quota_updated_ms = int(quota_mtime * 1000)
+        except Exception:
+            pass
+
     result = {
         "schemaVersion": 1,
         "id": "claude",
@@ -1233,9 +1475,9 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         "limits": limits,
         "recentWorkspaces": recent_workspaces,
         "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "quotaUpdatedAt": "",
-        "quotaUpdatedMs": 0,
-        "lastFullRefreshMs": int(time.time() * 1000),
+        "quotaUpdatedAt": quota_updated_at,
+        "quotaUpdatedMs": quota_updated_ms,
+        "lastFullRefreshMs": quota_updated_ms or int(time.time() * 1000),
         "usageStatusText": f"{active_status} • {clean_latest_model}",
         "authHelpText": ""
     }
@@ -1262,10 +1504,15 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     parser.add_argument("--force", action="store_true", help="Bypass cache and force refresh")
     parser.add_argument("--kill", type=str, default=None, help="Kill the running session by session ID")
+    parser.add_argument("--refresh-quota-bg", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--notify-low-quota", type=int, nargs="?", const=15, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     base_dir = expand_path(args.path) if args.path else default_base_dir()
+
+    if args.refresh_quota_bg:
+        bg_refresh_quota(base_dir)
+        return
 
     if args.kill:
         success = kill_session(args.kill, base_dir)
