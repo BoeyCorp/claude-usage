@@ -355,7 +355,16 @@ BarWidget {
     if (!provider) return "Claude Usage"
     var count = provider.activeSessions ? provider.activeSessions.length : (provider.hasActiveSession ? 1 : 0)
     var status = provider.hasActiveSession ? " (" + count + " " + (count === 1 ? "session" : "sessions") + " " + provider.activeStatus.toLowerCase() + ")" : " (Idle)"
-    return "Claude Code" + status + "\n" + (provider.todayPrompts || 0) + " prompts today • " + (provider.currentModel || "Claude")
+    var refMs = (provider && provider.lastFullRefreshMs > 0) ? provider.lastFullRefreshMs : (provider ? provider.lastUpdatedMs : 0)
+    var ageSec = refMs > 0 ? Math.max(0, Math.floor((root.nowMs - refMs) / 1000)) : -1
+    var refText = ""
+    if (ageSec >= 0) {
+      if (ageSec < 10) refText = " • Refreshed just now"
+      else if (ageSec < 60) refText = " • Refreshed " + ageSec + "s ago"
+      else if (ageSec < 3600) refText = " • Refreshed " + Math.floor(ageSec / 60) + "m ago"
+      else refText = " • Refreshed " + Math.floor(ageSec / 3600) + "h ago"
+    }
+    return "Claude Code" + status + "\n" + (provider.todayPrompts || 0) + " prompts today • " + (provider.currentModel || "Claude") + refText
   }
 
   width: button.implicitWidth
@@ -372,7 +381,7 @@ BarWidget {
 
   Timer {
     id: liveClockTimer
-    interval: 10000
+    interval: 1000
     running: root.popupOpen
     repeat: true
     onTriggered: root.nowMs = Date.now()
@@ -787,32 +796,68 @@ BarWidget {
           Layout.fillWidth: true
         }
 
-        Text {
-          textFormat: Text.PlainText
+        RowLayout {
+          id: refAgeRow
+          spacing: 3
           readonly property double refMs: (provider && provider.lastFullRefreshMs > 0) ? provider.lastFullRefreshMs : (provider ? provider.lastUpdatedMs : 0)
+          readonly property int ageSec: refMs > 0 ? Math.max(0, Math.floor((root.nowMs - refMs) / 1000)) : -1
           visible: !usageMain.refreshing && refMs > 0
-          readonly property int ageSec: refMs > 0 ? Math.floor((root.nowMs - refMs) / 1000) : -1
-          text: {
-            if (ageSec < 0) return ""
-            if (ageSec < 15) return "just now"
-            if (ageSec < 60) return ageSec + "s ago"
-            if (ageSec < 3600) return Math.floor(ageSec / 60) + "m ago"
-            return Math.floor(ageSec / 3600) + "h ago"
+
+          Text {
+            textFormat: Text.PlainText
+            text: ""
+            color: refAgeRow.ageSec > 300 ? root.urgent : dim
+            font.family: root.fontFamily
+            font.pixelSize: 8
+            opacity: 0.7
           }
-          color: ageSec > 300 ? root.urgent : dim
-          font.family: fontFamily
-          font.pixelSize: 9
-          opacity: 0.7
+
+          Text {
+            textFormat: Text.PlainText
+            text: {
+              var a = refAgeRow.ageSec
+              if (a < 0) return ""
+              if (a < 10) return "Refreshed just now"
+              if (a < 60) return "Refreshed " + a + "s ago"
+              if (a < 3600) return "Refreshed " + Math.floor(a / 60) + "m ago"
+              return "Refreshed " + Math.floor(a / 3600) + "h " + Math.floor((a % 3600) / 60) + "m ago"
+            }
+            color: refAgeRow.ageSec > 300 ? root.urgent : dim
+            font.family: fontFamily
+            font.pixelSize: 9
+            opacity: 0.8
+          }
         }
 
-        Text {
-          textFormat: Text.PlainText
+        RowLayout {
+          spacing: 3
           visible: usageMain.refreshing
-          text: "Updating…"
-          color: root.accent
-          font.family: fontFamily
-          font.pixelSize: 9
-          opacity: 0.8
+
+          Text {
+            textFormat: Text.PlainText
+            text: ""
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: 8
+            transformOrigin: Item.Center
+
+            RotationAnimation on rotation {
+              running: usageMain.refreshing
+              loops: Animation.Infinite
+              from: 0
+              to: 360
+              duration: 800
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Refreshing…"
+            color: root.accent
+            font.family: fontFamily
+            font.pixelSize: 9
+            opacity: 0.9
+          }
         }
       }
     }
@@ -836,13 +881,14 @@ BarWidget {
       }
 
       Button {
-        text: (root.refreshFlash || usageMain.refreshing) ? "" : ""
-        foreground: root.foreground
+        iconText: ""
+        iconSpinning: root.refreshFlash || usageMain.refreshing
+        foreground: (root.refreshFlash || usageMain.refreshing) ? root.accent : root.foreground
         tooltipText: "Refresh (r)"
         tooltipBackground: root.background
         tooltipForeground: root.foreground
         fontFamily: root.fontFamily
-        fontSize: 11
+        iconSize: 11
         horizontalPadding: 6
         verticalPadding: 4
         active: root.refreshFlash || usageMain.refreshing
