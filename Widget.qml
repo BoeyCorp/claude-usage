@@ -1018,6 +1018,12 @@ BarWidget {
       StatBlock {
         Layout.fillWidth: true
         Layout.preferredWidth: 1
+        value: provider ? usageMain.formatNumber(provider.todayTotalTokens || 0) : "0"
+        label: "tokens today"
+      }
+      StatBlock {
+        Layout.fillWidth: true
+        Layout.preferredWidth: 1
         value: provider ? String(provider.totalPrompts || 0) : "0"
         label: "total prompts"
       }
@@ -1331,7 +1337,9 @@ BarWidget {
                 var p = pCount
                 var s = sCount
                 var sFmt = s >= 1000 ? (s / 1000).toFixed(1) + "k" : String(s)
-                return p + " prompts · " + sFmt + " steps"
+                var tok = Number(modelData.todayTokens || 0)
+                var tFmt = tok > 0 ? (" · " + usageMain.formatNumber(tok) + " tok") : ""
+                return p + " prompts · " + sFmt + " steps" + tFmt
               }
               color: root.dim
               font.family: root.fontFamily

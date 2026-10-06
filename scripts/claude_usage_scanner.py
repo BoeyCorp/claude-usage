@@ -495,6 +495,7 @@ def parse_transcripts(
             "steps": s_count,
             "todayPrompts": data.get("todayPrompts", 0),
             "todaySteps": data.get("todaySteps", 0),
+            "todayTokens": int(today_tokens_by_model.get(clean_model_name, today_tokens_by_model.get(m, 0))),
             "todaySessions": len(data.get("todaySessions", set())),
             "weekPrompts": data.get("weekPrompts", 0),
             "weekSteps": data.get("weekSteps", 0),
