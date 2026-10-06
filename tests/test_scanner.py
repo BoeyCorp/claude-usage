@@ -151,28 +151,31 @@ class TestClaudeUsageScanner(unittest.TestCase):
                         "role": "assistant",
                         "model": "claude-sonnet-5",
                         "content": [{"type": "tool_use", "name": "Bash", "input": {}}],
-                        "usage": {"input_tokens": 10, "output_tokens": 5}
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 150}
                     }
                 },
             ]
             tpath.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
 
             # First parse: builds cache
-            tools1, models1, list1, latest1, steps1, tokens1 = parse_transcripts(
+            tools1, models1, list1, latest1, steps1, tokens1, extra1 = parse_transcripts(
                 projects_dir, "2026-09-08", ["2026-09-08"], base_dir=pdir
             )
             self.assertEqual(tools1["Bash"], 1)
             self.assertEqual(steps1["conv1"], 1)
+            self.assertEqual(extra1["todayCacheReadTokens"], 150)
+            self.assertGreater(extra1["todayCacheHitRate"], 0)
 
             cache_file = pdir / "cache" / "claude_usage_transcript_cache.json"
             self.assertTrue(cache_file.exists())
 
             # Second parse: reads from cache
-            tools2, models2, list2, latest2, steps2, tokens2 = parse_transcripts(
+            tools2, models2, list2, latest2, steps2, tokens2, extra2 = parse_transcripts(
                 projects_dir, "2026-09-08", ["2026-09-08"], base_dir=pdir
             )
             self.assertEqual(tools2["Bash"], 1)
             self.assertEqual(latest2, "claude-sonnet-5")
+            self.assertEqual(extra2["todayCacheReadTokens"], 150)
 
     def test_pid_alive(self):
         # The current process is definitely alive
@@ -421,11 +424,13 @@ class TestClaudeUsageScanner(unittest.TestCase):
                 check_and_send_quota_notifications(pdir, low_quota_groups, threshold_pct=15)
                 self.assertEqual(mock_run.call_count, 0)
 
-                # 4. Quota replenishes back to 100%
+                # 4. Quota replenishes back to 100%: sends 1 replenishment alert
                 check_and_send_quota_notifications(pdir, healthy_quota_groups, threshold_pct=15)
-                self.assertEqual(mock_run.call_count, 0)
+                self.assertEqual(mock_run.call_count, 1)
+                self.assertIn("Replenished", mock_run.call_args[0][0][7])
 
                 # 5. Quota drops again in the future: sends 1 notification
+                mock_run.reset_mock()
                 check_and_send_quota_notifications(pdir, low_quota_groups, threshold_pct=15)
                 self.assertEqual(mock_run.call_count, 1)
 
@@ -481,6 +486,23 @@ class TestClaudeUsageScanner(unittest.TestCase):
             in_backoff, rem = get_quota_backoff(pdir)
             self.assertFalse(in_backoff)
             self.assertEqual(rem, 0.0)
+
+    def test_group_session_hierarchy(self):
+        from scripts.claude_usage_scanner import group_session_hierarchy
+        sessions = [
+            {"conversationId": "parent-1", "title": "Main Project", "isSubagent": False, "parentConversationId": ""},
+            {"conversationId": "sub-1", "title": "Sub Task 1", "isSubagent": True, "parentConversationId": "parent-1"},
+            {"conversationId": "parent-2", "title": "Another Project", "isSubagent": False, "parentConversationId": ""},
+            {"conversationId": "sub-2", "title": "Sub Task 2", "isSubagent": True, "parentConversationId": "parent-1"},
+        ]
+        grouped = group_session_hierarchy(sessions)
+        self.assertEqual(len(grouped), 4)
+        self.assertEqual(grouped[0]["conversationId"], "parent-1")
+        self.assertEqual(grouped[1]["conversationId"], "sub-1")
+        self.assertEqual(grouped[1]["indent"], 1)
+        self.assertEqual(grouped[2]["conversationId"], "sub-2")
+        self.assertEqual(grouped[2]["indent"], 1)
+        self.assertEqual(grouped[3]["conversationId"], "parent-2")
 
 
 if __name__ == "__main__":

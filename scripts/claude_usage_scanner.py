@@ -287,9 +287,20 @@ def parse_transcripts(
     latest_model = default_model
     session_step_counts: dict[str, int] = {}
     today_tokens_by_model: dict[str, float] = {}
+    today_cache_read_tokens: int = 0
+    today_cache_creation_tokens: int = 0
+    today_input_tokens: int = 0
+    today_output_tokens: int = 0
+    session_subagents: dict[str, dict[str, Any]] = {}
 
     if not projects_dir.exists():
-        return tool_counter, models_stats, [], latest_model, session_step_counts, today_tokens_by_model
+        extra_empty = {
+            "todayCacheReadTokens": 0,
+            "todayCacheCreationTokens": 0,
+            "todayCacheHitRate": 0.0,
+            "sessionSubagents": {}
+        }
+        return tool_counter, models_stats, [], latest_model, session_step_counts, today_tokens_by_model, extra_empty
 
     recent_dates_set = set(recent_dates) if recent_dates else set()
 
@@ -328,6 +339,7 @@ def parse_transcripts(
                 cached_entry
                 and cached_entry.get("mtime") == mtime
                 and cached_entry.get("size") == size
+                and "today_cache_read" in cached_entry
             ):
                 entry_tools = cached_entry.get("tools", {})
                 entry_model = cached_entry.get("model", default_model)
@@ -336,6 +348,13 @@ def parse_transcripts(
                 total_steps = cached_entry.get("total_steps", 0)
                 total_prompts = cached_entry.get("total_prompts", 0)
                 today_tokens = cached_entry.get("today_tokens", 0)
+                file_cache_read = cached_entry.get("today_cache_read", 0)
+                file_cache_create = cached_entry.get("today_cache_create", 0)
+                file_in_tokens = cached_entry.get("today_input", 0)
+                file_out_tokens = cached_entry.get("today_output", 0)
+                file_is_subagent = cached_entry.get("is_subagent", False)
+                file_subagent_name = cached_entry.get("subagent_name", "")
+                file_parent_conv_id = cached_entry.get("parent_conv_id", "")
             else:
                 entry_tools = Counter()
                 entry_model = default_model
@@ -344,6 +363,13 @@ def parse_transcripts(
                 total_steps = 0
                 total_prompts = 0
                 today_tokens = 0
+                file_cache_read = 0
+                file_cache_create = 0
+                file_in_tokens = 0
+                file_out_tokens = 0
+                file_is_subagent = False
+                file_subagent_name = ""
+                file_parent_conv_id = ""
 
                 try:
                     with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -360,6 +386,13 @@ def parse_transcripts(
                             message = entry.get("message") or {}
                             created_at = entry.get("timestamp") or ""
                             entry_day = local_date_from_timestamp(created_at)
+
+                            if entry.get("isSidechain") or entry.get("agentName") or entry.get("sourceToolAssistantUUID"):
+                                file_is_subagent = True
+                                if entry.get("agentName"):
+                                    file_subagent_name = sanitize_plain_text(entry.get("agentName"), 80)
+                                if entry.get("parentSessionId"):
+                                    file_parent_conv_id = sanitize_plain_text(entry.get("parentSessionId"), 100)
 
                             if entry_type == "assistant" and isinstance(message, dict):
                                 total_steps += 1
@@ -379,13 +412,15 @@ def parse_transcripts(
 
                                 usage = message.get("usage") or {}
                                 if isinstance(usage, dict) and entry_day == today_str:
-                                    tok = (
-                                        int(usage.get("input_tokens") or 0)
-                                        + int(usage.get("output_tokens") or 0)
-                                        + int(usage.get("cache_creation_input_tokens") or 0)
-                                        + int(usage.get("cache_read_input_tokens") or 0)
-                                    )
-                                    today_tokens += tok
+                                    u_in = int(usage.get("input_tokens") or 0)
+                                    u_out = int(usage.get("output_tokens") or 0)
+                                    u_create = int(usage.get("cache_creation_input_tokens") or 0)
+                                    u_read = int(usage.get("cache_read_input_tokens") or 0)
+                                    file_in_tokens += u_in
+                                    file_out_tokens += u_out
+                                    file_cache_create += u_create
+                                    file_cache_read += u_read
+                                    today_tokens += (u_in + u_out + u_create + u_read)
 
                             elif entry_type == "user" and isinstance(message, dict):
                                 content = message.get("content")
@@ -404,11 +439,28 @@ def parse_transcripts(
                     "prompts_by_date": dict(prompts_by_date),
                     "total_steps": total_steps,
                     "total_prompts": total_prompts,
-                    "today_tokens": today_tokens
+                    "today_tokens": today_tokens,
+                    "today_cache_read": file_cache_read,
+                    "today_cache_create": file_cache_create,
+                    "today_input": file_in_tokens,
+                    "today_output": file_out_tokens,
+                    "is_subagent": file_is_subagent,
+                    "subagent_name": file_subagent_name,
+                    "parent_conv_id": file_parent_conv_id
                 }
                 cache_dirty = True
 
             session_step_counts[conv_id] = total_steps
+            today_cache_read_tokens += file_cache_read
+            today_cache_creation_tokens += file_cache_create
+            today_input_tokens += file_in_tokens
+            today_output_tokens += file_out_tokens
+            if file_is_subagent:
+                session_subagents[conv_id] = {
+                    "isSubagent": True,
+                    "agentName": file_subagent_name,
+                    "parentConversationId": file_parent_conv_id
+                }
 
             # Track latest model from most recently modified file
             if not found_latest_model and entry_model:
@@ -510,7 +562,48 @@ def parse_transcripts(
         formatted_models[clean_model_name] = entry
         model_list.append(entry)
 
-    return tool_counter, formatted_models, model_list, latest_model, session_step_counts, today_tokens_by_model
+    cache_denom = today_cache_read_tokens + today_cache_creation_tokens + today_input_tokens
+    today_cache_hit_rate = round((today_cache_read_tokens / cache_denom) * 100.0, 1) if cache_denom > 0 else 0.0
+    extra_stats = {
+        "todayCacheReadTokens": today_cache_read_tokens,
+        "todayCacheCreationTokens": today_cache_creation_tokens,
+        "todayInputTokens": today_input_tokens,
+        "todayOutputTokens": today_output_tokens,
+        "todayCacheHitRate": today_cache_hit_rate,
+        "sessionSubagents": session_subagents
+    }
+
+    return tool_counter, formatted_models, model_list, latest_model, session_step_counts, today_tokens_by_model, extra_stats
+
+
+def group_session_hierarchy(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group subagent sessions hierarchically directly under their parent sessions."""
+    if not sessions:
+        return []
+
+    by_id = {s["conversationId"]: s for s in sessions if s.get("conversationId")}
+    parent_to_children: dict[str, list[dict[str, Any]]] = {}
+    standalone: list[dict[str, Any]] = []
+
+    for s in sessions:
+        parent_id = s.get("parentConversationId")
+        if s.get("isSubagent") and parent_id and parent_id in by_id:
+            parent_to_children.setdefault(parent_id, []).append(s)
+        else:
+            standalone.append(s)
+
+    result: list[dict[str, Any]] = []
+    for s in standalone:
+        result.append(s)
+        cid = s.get("conversationId")
+        if cid and cid in parent_to_children:
+            for child in parent_to_children[cid]:
+                child_copy = dict(child)
+                child_copy["indent"] = 1
+                child_copy["isSubagent"] = True
+                result.append(child_copy)
+
+    return result
 
 
 def format_hours_duration(hours: float) -> str:
@@ -1146,7 +1239,21 @@ def check_and_send_quota_notifications(
             if not low_buckets:
                 # Quota is healthy (above threshold)
                 if was_low:
-                    # Quota replenished! Reset state so future drops trigger an alert
+                    # Quota replenished! Notify the user and reset state so future drops trigger an alert
+                    headline = f"Claude Quota Replenished ({g_name})"
+                    details = f"{g_name} limits have reset and are ready to use."
+                    cmd = [
+                        "omarchy-notification-send",
+                        "--app-name", "claude-usage",
+                        "-u", "normal",
+                        "-g", "󰚩",
+                        headline,
+                        details
+                    ]
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=4)
+                    except Exception:
+                        pass
                     group_state["alert_active"] = False
                     group_state["last_notified_pct"] = 100
                     state_data[g_name] = group_state
@@ -1244,7 +1351,7 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
     daily_prompts, total_prompts_hist, recent_prompts, ws_counter = parse_history_file(history_path, recent_dates)
 
     # 3. Parse Transcripts for Tool Calls, Models & Model List (cached & incremental)
-    tool_counter, model_usage_dict, model_list, latest_model, session_step_counts, today_tokens_by_model = parse_transcripts(
+    tool_counter, model_usage_dict, model_list, latest_model, session_step_counts, today_tokens_by_model, extra_stats = parse_transcripts(
         projects_dir, today_str, recent_dates, default_model=configured_model, base_dir=base_dir
     )
 
@@ -1368,6 +1475,20 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         if len(last_p) < 12 and len(first_p) > len(last_p):
             preview = first_p
 
+        is_sub = False
+        s_agent_name = item.get("agentName", "Claude Code")
+        sub_info = extra_stats.get("sessionSubagents", {}).get(cid)
+        parent_cid = ""
+        if sub_info:
+            is_sub = True
+            if sub_info.get("agentName"):
+                s_agent_name = sub_info["agentName"]
+            if sub_info.get("parentConversationId"):
+                parent_cid = sub_info["parentConversationId"]
+
+        active_info = active_sessions_map.get(cid, {}) if is_active else {}
+        sess_pid = active_info.get("pid")
+
         s_item = {
             "conversationId": cid,
             "title": sanitize_plain_text(title, 150),
@@ -1378,14 +1499,20 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
             "workspace": clean_ws,
             "workspaceName": ws_name,
             "status": "active" if is_active else "idle",
-            "agentName": item.get("agentName", "Claude Code"),
+            "agentName": s_agent_name,
             "notFullyIdle": is_working,
             "killed": False,
-            "isActive": is_active
+            "isActive": is_active,
+            "pid": int(sess_pid) if sess_pid and str(sess_pid).isdigit() else None,
+            "isSubagent": is_sub,
+            "parentConversationId": parent_cid,
+            "indent": 0
         }
         all_sessions.append(s_item)
         if is_active:
             active_sessions.append(s_item)
+
+    all_sessions = group_session_hierarchy(all_sessions)
 
     has_active_session = len(active_lock_ids) > 0
     if has_active_session:
@@ -1480,6 +1607,9 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         "todaySteps": today_db_steps,
         "todayTotalTokens": today_total_tokens,
         "todayTokensByModel": today_tokens_by_model_clean,
+        "todayCacheReadTokens": extra_stats.get("todayCacheReadTokens", 0),
+        "todayCacheCreationTokens": extra_stats.get("todayCacheCreationTokens", 0),
+        "todayCacheHitRate": extra_stats.get("todayCacheHitRate", 0.0),
         "recentDays": recent_days_data,
         "totalPrompts": total_prompts_hist,
         "totalSessions": total_db_sessions,

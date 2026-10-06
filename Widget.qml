@@ -112,13 +112,31 @@ BarWidget {
     }
   }
 
-  function resumeSession(conversationId, workspacePath) {
+  function pathFromUrl(url) {
+    var value = String(url || "")
+    if (value.indexOf("file://") === 0)
+      return decodeURIComponent(value.substring(7))
+    return value
+  }
+
+  readonly property string focusScriptPath: pathFromUrl(Qt.resolvedUrl("scripts/claude_focus_or_resume.py"))
+
+  function resumeSession(conversationId, workspacePath, title, pid) {
     if (!conversationId) return
-    var args = getTerminalArgs(["claude", "--resume", conversationId], workspacePath)
+    var termArgs = getTerminalArgs(["claude", "--resume", conversationId], workspacePath)
+    var cmd = ["python3", root.focusScriptPath, "--cid", conversationId]
+    if (title) cmd = cmd.concat(["--title", title])
+    if (pid) cmd = cmd.concat(["--pid", String(pid)])
+    cmd = cmd.concat(["--"]).concat(termArgs)
     try {
-      Quickshell.execDetached(["uwsm-app", "--"].concat(args))
+      Quickshell.execDetached(cmd)
     } catch (e) {
-      Quickshell.execDetached(args)
+      console.warn("resumeSession focus fallback", e)
+      try {
+        Quickshell.execDetached(["uwsm-app", "--"].concat(termArgs))
+      } catch (e2) {
+        Quickshell.execDetached(termArgs)
+      }
     }
     root.close()
   }
@@ -191,7 +209,7 @@ BarWidget {
 
     if (next.badgeMode !== undefined && next.badgeMode !== null) {
       var bm = String(next.badgeMode).toLowerCase().trim()
-      if (bm !== "active" && bm !== "prompts" && bm !== "off") bm = "active"
+      if (bm !== "active" && bm !== "prompts" && bm !== "quota" && bm !== "off") bm = "active"
       next.badgeMode = bm
       next.showBadge = bm !== "off"
     } else {
@@ -292,7 +310,7 @@ BarWidget {
     next[name] = value
     if (name === "badgeMode") {
       var bm = String(value).toLowerCase().trim()
-      if (bm !== "active" && bm !== "prompts" && bm !== "off") bm = "active"
+      if (bm !== "active" && bm !== "prompts" && bm !== "quota" && bm !== "off") bm = "active"
       next.badgeMode = bm
       next.showBadge = bm !== "off"
     } else if (name === "showBadge") {
@@ -411,12 +429,30 @@ BarWidget {
         return provider.activeSessions.length
       return provider.hasActiveSession ? 1 : 0
     }
+    readonly property int lowestQuotaPercent: {
+      if (!provider || !provider.quotaGroups) return 100
+      var lowest = 100
+      var found = false
+      for (var i = 0; i < provider.quotaGroups.length; i++) {
+        var g = provider.quotaGroups[i]
+        var buckets = g.buckets || []
+        for (var j = 0; j < buckets.length; j++) {
+          var rem = buckets[j].remainingPercent
+          if (rem !== undefined && rem !== null) {
+            found = true
+            if (rem < lowest) lowest = rem
+          }
+        }
+      }
+      return found ? lowest : 100
+    }
     readonly property int promptCount: provider ? (provider.todayPrompts || 0) : 0
     readonly property int badgeCount: badgeMode === "prompts" ? promptCount : (badgeMode === "active" ? activeCount : 0)
     readonly property bool hasBadge: {
       if (badgeMode === "off") return false
       if (badgeMode === "prompts") return true
       if (badgeMode === "active") return activeCount > 0
+      if (badgeMode === "quota") return true
       return false
     }
 
@@ -476,8 +512,8 @@ BarWidget {
         id: badgeText
         visible: chip.hasBadge
         textFormat: Text.PlainText
-        text: String(chip.badgeCount)
-        color: root.isWorking ? "#10B981" : (root.isWaiting ? "#3B82F6" : root.dim)
+        text: chip.badgeMode === "quota" ? (chip.lowestQuotaPercent + "%") : String(chip.badgeCount)
+        color: chip.badgeMode === "quota" ? (chip.lowestQuotaPercent <= 15 ? root.urgent : (chip.lowestQuotaPercent <= 30 ? "#F59E0B" : root.accent)) : (root.isWorking ? "#10B981" : (root.isWaiting ? "#3B82F6" : root.dim))
         font.family: root.fontFamily
         font.pixelSize: 9
         font.bold: true
@@ -999,33 +1035,90 @@ BarWidget {
     visible: !!provider && provider.ready && provider.hasLocalStats
     title: "Today & Totals"
 
-    RowLayout {
+    ColumnLayout {
       width: parent.width
-      spacing: Style.space(8)
+      spacing: Style.space(6)
 
-      StatBlock {
+      RowLayout {
         Layout.fillWidth: true
-        Layout.preferredWidth: 1
-        value: provider ? String(provider.todayPrompts || 0) : "0"
-        label: "prompts today"
+        spacing: Style.space(8)
+
+        StatBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          value: provider ? String(provider.todayPrompts || 0) : "0"
+          label: "prompts today"
+        }
+        StatBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          value: provider ? String(provider.todaySteps || 0) : "0"
+          label: "steps today"
+        }
+        StatBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          value: provider ? usageMain.formatNumber(provider.todayTotalTokens || 0) : "0"
+          label: "tokens today"
+        }
+        StatBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          value: provider ? String(provider.totalPrompts || 0) : "0"
+          label: "total prompts"
+        }
       }
-      StatBlock {
+
+      Rectangle {
+        visible: !!provider && (provider.todayCacheReadTokens > 0 || provider.todayCacheHitRate > 0)
         Layout.fillWidth: true
-        Layout.preferredWidth: 1
-        value: provider ? String(provider.todaySteps || 0) : "0"
-        label: "steps today"
-      }
-      StatBlock {
-        Layout.fillWidth: true
-        Layout.preferredWidth: 1
-        value: provider ? usageMain.formatNumber(provider.todayTotalTokens || 0) : "0"
-        label: "tokens today"
-      }
-      StatBlock {
-        Layout.fillWidth: true
-        Layout.preferredWidth: 1
-        value: provider ? String(provider.totalPrompts || 0) : "0"
-        label: "total prompts"
+        Layout.preferredHeight: 22
+        radius: 4
+        color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08)
+        border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22)
+        border.width: 1
+
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 8
+          anchors.rightMargin: 8
+          spacing: 6
+
+          Text {
+            textFormat: Text.PlainText
+            text: "⚡ Prompt Cache:"
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: 10
+            font.bold: true
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: (provider ? (provider.todayCacheHitRate || 0) : 0) + "% hit rate"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: 10
+            font.bold: true
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "·"
+            color: root.dim
+            font.pixelSize: 9
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Saved " + usageMain.formatNumber(provider ? (provider.todayCacheReadTokens || 0) : 0) + " cached tokens"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: 10
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+          }
+        }
       }
     }
   }
@@ -1529,6 +1622,7 @@ BarWidget {
           Rectangle {
             id: sessionItemCard
             Layout.fillWidth: true
+            Layout.leftMargin: (modelData.indent ? 16 : 0)
             implicitHeight: sessionCol.implicitHeight + 8
             radius: 4
             readonly property bool isHovered: sessionMouseArea.containsMouse || killMouse.containsMouse
@@ -1541,7 +1635,7 @@ BarWidget {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.resumeSession(modelData.conversationId, modelData.workspace)
+              onClicked: root.resumeSession(modelData.conversationId, modelData.workspace, modelData.preview || modelData.title, modelData.pid)
             }
 
             ColumnLayout {
@@ -1555,7 +1649,17 @@ BarWidget {
                 spacing: 6
 
                 Text {
-                  visible: index < 5
+                  visible: !!modelData.isSubagent
+                  textFormat: Text.PlainText
+                  text: "└─"
+                  color: root.accent
+                  font.family: fontFamily
+                  font.pixelSize: 10
+                  font.bold: true
+                }
+
+                Text {
+                  visible: index < 5 && !modelData.isSubagent
                   textFormat: Text.PlainText
                   text: "[" + (index + 1) + "]"
                   color: sessionItemCard.isHovered ? root.accent : root.dim
@@ -1577,6 +1681,27 @@ BarWidget {
 
                 RowLayout {
                   spacing: 4
+
+                  Rectangle {
+                    visible: !!modelData.isSubagent
+                    color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                    border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.3)
+                    border.width: 1
+                    radius: 3
+                    Layout.preferredHeight: 14
+                    Layout.preferredWidth: subagentBadgeText.implicitWidth + 6
+
+                    Text {
+                      id: subagentBadgeText
+                      textFormat: Text.PlainText
+                      text: (modelData.agentName && modelData.agentName !== "Claude Code") ? modelData.agentName.toUpperCase() : "SUBAGENT"
+                      color: root.accent
+                      font.family: fontFamily
+                      font.pixelSize: 8
+                      font.bold: true
+                      anchors.centerIn: parent
+                    }
+                  }
 
                   Rectangle {
                     visible: !!modelData.isActive
@@ -1765,8 +1890,9 @@ BarWidget {
           fontFamily: root.fontFamily
           fontSize: 10
           options: [
-            { value: "active", label: "Active Sessions", tooltip: "Show badge count when Claude Code sessions are active" },
-            { value: "prompts", label: "Today's Prompts", tooltip: "Show total prompt count for today" },
+            { value: "active", label: "Active", tooltip: "Show badge count when Claude Code sessions are active" },
+            { value: "prompts", label: "Prompts", tooltip: "Show total prompt count for today" },
+            { value: "quota", label: "Quota %", tooltip: "Show lowest remaining quota percentage directly on bar" },
             { value: "off", label: "Off", tooltip: "Hide badge entirely" }
           ]
           value: root.draftValue("badgeMode", root.draftValue("showBadge", true) === false ? "off" : "active")
