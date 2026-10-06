@@ -364,7 +364,7 @@ BarWidget {
       else if (ageSec < 3600) refText = " • Refreshed " + Math.floor(ageSec / 60) + "m ago"
       else refText = " • Refreshed " + Math.floor(ageSec / 3600) + "h ago"
     }
-    return "Claude Code" + status + "\n" + (provider.todayPrompts || 0) + " prompts today • " + (provider.currentModel || "Claude") + refText
+    return "Claude Code" + status + "\n" + (provider.todayPrompts || 0) + " prompts today" + refText
   }
 
   width: button.implicitWidth
@@ -788,7 +788,7 @@ BarWidget {
 
         Text {
           textFormat: Text.PlainText
-          text: provider ? (provider.currentModel || "Claude") : ""
+          text: provider ? (provider.usageStatusText || "Idle") : "Idle"
           color: dim
           font.family: fontFamily
           font.pixelSize: 10
