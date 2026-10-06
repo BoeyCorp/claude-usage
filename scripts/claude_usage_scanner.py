@@ -1609,6 +1609,8 @@ def scan(base_dir: Path, force: bool = False, alert_threshold: int | None = None
         "todayTokensByModel": today_tokens_by_model_clean,
         "todayCacheReadTokens": extra_stats.get("todayCacheReadTokens", 0),
         "todayCacheCreationTokens": extra_stats.get("todayCacheCreationTokens", 0),
+        "todayInputTokens": extra_stats.get("todayInputTokens", 0),
+        "todayOutputTokens": extra_stats.get("todayOutputTokens", 0),
         "todayCacheHitRate": extra_stats.get("todayCacheHitRate", 0.0),
         "recentDays": recent_days_data,
         "totalPrompts": total_prompts_hist,
