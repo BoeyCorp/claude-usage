@@ -488,7 +488,7 @@ class TestClaudeUsageScanner(unittest.TestCase):
             self.assertEqual(rem, 0.0)
 
     def test_group_session_hierarchy(self):
-        from scripts.claude_usage_scanner import group_session_hierarchy
+        from claude_usage_scanner import group_session_hierarchy
         sessions = [
             {"conversationId": "parent-1", "title": "Main Project", "isSubagent": False, "parentConversationId": ""},
             {"conversationId": "sub-1", "title": "Sub Task 1", "isSubagent": True, "parentConversationId": "parent-1"},
